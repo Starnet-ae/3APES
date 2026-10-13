@@ -1,0 +1,12 @@
+**/.env
+**/.env.local
+**/.env.production
+**/.env.*.local
+**/node_modules/
+**/target/
+**/dist/
+**/data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.DS_Store

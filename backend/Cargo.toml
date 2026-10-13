@@ -1,0 +1,22 @@
+[package]
+name = "threeapes-mvp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+argon2 = "0.5"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+chrono = "0.4"
+futures-util = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }

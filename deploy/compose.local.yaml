@@ -1,0 +1,24 @@
+services:
+  router:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    ports:
+      - '127.0.0.1:8081:8080'
+
+    env_file:
+      - ../backend/.env
+
+    environment:
+      BIND_ADDRESS: '0.0.0.0:8080'
+      SQLITE_PATH: '/data/3apes.db'
+
+    volumes:
+      - sqlite_data:/data
+
+volumes:
+  sqlite_data:
+    name: 3apes_sqlite_data_local
