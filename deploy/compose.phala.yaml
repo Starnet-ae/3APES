@@ -1,6 +1,6 @@
 services:
   router:
-    image: ghcr.io/OWNER/REPO:sha-REPLACE_WITH_GIT_COMMIT
+    image: ghcr.io/starnet-ae/3apes:sha-094599b703b1d4da2742077df6b59b9fbcdf0211
 
     restart: unless-stopped
 
@@ -15,7 +15,7 @@ services:
       SIGNUP_ENABLED: '${SIGNUP_ENABLED:-false}'
 
       LLM_BASE_URL: 'https://inference.phala.com/v1'
-      LLM_API_KEY: '${LLM_API_KEY:?LLM_API_KEY must be set}'
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set}
 
       MODEL_SMALL_ID: ''
       MODEL_MEDIUM_ID: 'deepseek/deepseek-v3.2'
