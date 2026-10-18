@@ -1,5 +1,8 @@
 import { FormEvent, KeyboardEvent, useEffect, useState } from 'react'
 import { api, setSessionToken, hasSession, streamMessage, type ApiKey, type Chat, type ChatDetail, type Message, type Model } from './api'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 
 type View = 'router' | 'api'
 
@@ -110,7 +113,15 @@ function RouterView() {
       <div className="privacy-banner"><div className="privacy-icon">◈</div><div><strong>Privacy controls are being integrated.</strong><span>Check independent TEE attestations before sending sensitive prompts. This MVP does not yet verify model/TEE measurements.</span></div></div>
       <div className="messages" aria-live="polite">
         {messages.length===0&&<div className="blank-chat"><h2>What would you like to ask?</h2><p>Choose a model tier or use Auto routing.</p></div>}
-        {messages.map(m=><div key={m.id} className={`message-row ${m.role}`}><div className="message-bubble"><div className="message-label">{m.role==='user'?'YOU':'3APES'}</div><p>{m.content || (busy ? 'Generating…' : '')}</p>{m.model&&<div className="route-chip">Model: {m.model}</div>}</div></div>)}
+        {messages.map(m=><div key={m.id} className={`message-row ${m.role}`}><div className="message-bubble"><div className="message-label">{m.role==='user'?'YOU':'3APES'}</div>{m.role === 'assistant' ? (
+  <div className="message-markdown">
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+      {m.content || (busy ? 'Generating…' : '')}
+    </ReactMarkdown>
+  </div>
+) : (
+  <p className="user-message-text">{m.content}</p>
+)}{m.model&&<div className="route-chip">Model: {m.model}</div>}</div></div>)}
       </div>
       {error&&<div className="error-text chat-error" role="alert">{error}</div>}
       <form className="composer" onSubmit={send}><textarea aria-label="Message" placeholder="Ask privately…" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={(e:KeyboardEvent<HTMLTextAreaElement>)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();e.currentTarget.form?.requestSubmit()}}}/><div className="composer-footer"><span className="composer-security">Transport: HTTPS in production · Attestation pending</span><button className="send-button" type="submit" disabled={busy||!prompt.trim()||models.length===0} aria-label="Send prompt">{busy?'…':'➜'}</button></div></form>
