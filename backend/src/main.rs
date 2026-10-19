@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, SqlitePool};
-use std::{env, path::Path as FilePath, sync::Arc, time::Duration};
+use std::{env, path::Path as FilePath, sync::Arc, time::{Duration, Instant}};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
@@ -43,12 +43,16 @@ struct Settings {
     llm_base_url: String,
     llm_key: String,
     signup_enabled: bool,
+    resend_api_key: String,
+    mail_from: String,
+    app_public_url: String,
 }
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
     client: reqwest::Client,
     cfg: Arc<Settings>,
+    models_cache: Arc<tokio::sync::RwLock<Option<(Instant, Vec<Model>)>>>,
 }
 #[derive(Deserialize)]
 struct Credentials { email: String, password: String }
@@ -63,9 +67,18 @@ struct ChatDetail { chat: Chat, messages: Vec<Message> }
 #[derive(Deserialize)]
 struct ChatInput { title: Option<String> }
 #[derive(Deserialize)]
-struct SendInput { content: String, tier: String }
-#[derive(Serialize)]
-struct Model { tier: &'static str, name: String }
+struct SendInput { content: String, #[serde(default)] model: Option<String>, #[serde(default)] tier: Option<String> }
+#[derive(Clone, Serialize)]
+struct Model {
+    id: String,
+    name: String,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+}
+#[derive(Deserialize)]
+struct EmailInput { email: String }
+#[derive(Deserialize)]
+struct PasswordResetInput { token: String, password: String }
 #[derive(Serialize, sqlx::FromRow)]
 struct ApiKeyRow { id: String, label: String, prefix: String, created_at: i64, last_used_at: Option<i64> }
 #[derive(Deserialize)]
@@ -143,14 +156,136 @@ async fn logout(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Valu
     }
     Ok(Json(json!({"ok": true})))
 }
+// Fetch the provider's complete live model catalog, never a hardcoded list.
+// Cache briefly to avoid burdening Phala and to keep selection consistent.
+fn model_num(item: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        let value = item.get(key)?;
+        value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok())
+    })
+}
+fn parse_provider_models(value: &Value) -> Result<Vec<Model>, ApiError> {
+    let entries = value.get("data").or_else(|| value.get("models")).unwrap_or(value)
+        .as_array().ok_or_else(|| fail(StatusCode::BAD_GATEWAY, "Invalid provider model catalog"))?;
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let Some(model_id) = entry.get("id").and_then(Value::as_str) else { continue; };
+        if model_id.is_empty() || model_id.len() > 256 || !seen.insert(model_id.to_string()) { continue; }
+        let name = entry.get("name").and_then(Value::as_str).filter(|x| !x.is_empty())
+            .unwrap_or(model_id).to_string();
+        result.push(Model {
+            id: model_id.into(), name,
+            context_window: model_num(entry, &["context_window", "context_length", "context_window_length"]),
+            max_output_tokens: model_num(entry, &["max_output_length", "max_output_tokens", "max_completion_tokens"]),
+        });
+    }
+    result.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    if result.is_empty() { return Err(fail(StatusCode::BAD_GATEWAY, "Provider returned no usable models")); }
+    Ok(result)
+}
+async fn provider_models(s: &AppState) -> Result<Vec<Model>, ApiError> {
+    {
+        let cache = s.models_cache.read().await;
+        if let Some((when, data)) = cache.as_ref() {
+            if when.elapsed() < Duration::from_secs(300) { return Ok(data.clone()); }
+        }
+    }
+    if s.cfg.llm_base_url.is_empty() { return Err(fail(StatusCode::SERVICE_UNAVAILABLE,"LLM_BASE_URL not configured")); }
+    let url = format!("{}/models", s.cfg.llm_base_url.trim_end_matches('/'));
+    let mut request = s.client.get(url);
+    if !s.cfg.llm_key.is_empty() { request = request.bearer_auth(&s.cfg.llm_key); }
+    let response = request.send().await.map_err(|_| fail(StatusCode::BAD_GATEWAY, "Unable to load provider models"))?;
+    if !response.status().is_success() {
+        eprintln!("Model catalog request failed with HTTP {}", response.status());
+        return Err(fail(StatusCode::BAD_GATEWAY, "Unable to load provider models"));
+    }
+    let raw: Value = response.json().await.map_err(|_| fail(StatusCode::BAD_GATEWAY, "Invalid provider model response"))?;
+    let models = parse_provider_models(&raw)?;
+    *s.models_cache.write().await = Some((Instant::now(), models.clone()));
+    Ok(models)
+}
 async fn models(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     auth(&s, &headers).await?;
-    let mut v = Vec::new();
-    if !s.cfg.small.is_empty() { v.push(Model { tier: "small", name: s.cfg.small.clone() }); }
-    if !s.cfg.medium.is_empty() { v.push(Model { tier: "medium", name: s.cfg.medium.clone() }); }
-    if !s.cfg.large.is_empty() { v.push(Model { tier: "large", name: s.cfg.large.clone() }); }
-    Ok(Json(json!({"models": v, "attestation": "not_verified", "billing": "not_configured"})))
+    let models = provider_models(&s).await?;
+    Ok(Json(json!({"models": models, "attestation": "not_verified", "billing":"not_configured"})))
 }
+
+// Mail credentials stay inside the router CVM. The reset token is never logged or stored in plaintext.
+async fn forgot_password(State(s): State<AppState>, Json(input): Json<EmailInput>) -> ApiResult<Value> {
+    if s.cfg.resend_api_key.is_empty() || s.cfg.mail_from.is_empty() || s.cfg.app_public_url.is_empty() {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "Password recovery is not configured"));
+    }
+    let email = input.email.trim().to_lowercase();
+    let generic = json!({"message":"If this email has an account, a password reset link will be sent."});
+    if email.len() > 254 || !email.contains('@') { return Ok(Json(generic)); }
+    // Atomic, per-email request throttle, even when the address does not exist.
+    let cutoff = now() - 300;
+    sqlx::query("DELETE FROM password_reset_limits WHERE last_requested_at < ?")
+        .bind(now() - 86400).execute(&s.db).await.map_err(internal)?;
+    let allowed = sqlx::query("INSERT INTO password_reset_limits(identity_hash,last_requested_at) VALUES (?,?) ON CONFLICT(identity_hash) DO UPDATE SET last_requested_at=excluded.last_requested_at WHERE last_requested_at < ?")
+        .bind(hash(&email)).bind(now()).bind(cutoff).execute(&s.db).await.map_err(internal)?.rows_affected() > 0;
+    if !allowed { return Ok(Json(generic)); }
+    let user_id: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE email=?")
+        .bind(&email).fetch_optional(&s.db).await.map_err(internal)?;
+    if let Some(user_id) = user_id {
+        let token = random_secret("pr_");
+        let token_hash = hash(&token);
+        sqlx::query("DELETE FROM password_resets WHERE user_id=? OR expires_at<=?")
+            .bind(&user_id).bind(now()).execute(&s.db).await.map_err(internal)?;
+        sqlx::query("INSERT INTO password_resets(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)")
+            .bind(&token_hash).bind(&user_id).bind(now() + 20*60).bind(now())
+            .execute(&s.db).await.map_err(internal)?;
+        let mut url = match reqwest::Url::parse(&s.cfg.app_public_url) {
+            Ok(x) if x.scheme() == "https" || (x.scheme()=="http" && x.host_str()==Some("localhost")) => x,
+            _ => return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "Password recovery URL is misconfigured")),
+        };
+        url.set_fragment(Some(&format!("/reset-password?token={token}")));
+        let link = url.to_string();
+        // Send asynchronously so request timing does not reveal whether an email has an account.
+        tokio::spawn(async move {
+            let result = s.client.post("https://api.resend.com/emails")
+                .bearer_auth(&s.cfg.resend_api_key)
+                .header("User-Agent", "3apes-router/1.0")
+                .json(&json!({"from":s.cfg.mail_from,"to":[email],"subject":"Reset your 3apes password",
+                    "text":format!("Use this link to reset your 3apes password (valid for 20 minutes):\n\n{link}\n\nIf you did not request this, ignore the message."),
+                    "html":format!("<p>You requested a password reset for 3apes.</p><p><a href=\"{link}\">Reset your password</a></p><p>This link expires in 20 minutes. If you didn't request it, ignore this email.</p>") }))
+                .send().await;
+            match result {
+                Ok(res) if res.status().is_success() => {},
+                other => {
+                    // Do not expose whether the address exists, nor the link itself.
+                    match other { Ok(res)=> eprintln!("Reset email service rejected request: HTTP {}",res.status()), Err(_)=>eprintln!("Reset email service unreachable") }
+                    let _ = sqlx::query("DELETE FROM password_resets WHERE token_hash=?")
+                        .bind(token_hash).execute(&s.db).await;
+                }
+            }
+        });
+    }
+    Ok(Json(generic))
+}
+async fn reset_password(State(s): State<AppState>, Json(input): Json<PasswordResetInput>) -> ApiResult<Value> {
+    if input.password.len() < 12 || input.password.len() > 128 {
+        return Err(fail(StatusCode::BAD_REQUEST, "Password must contain 12–128 characters"));
+    }
+    if !input.token.starts_with("pr_") || input.token.len() > 128 {
+        return Err(fail(StatusCode::BAD_REQUEST, "Invalid or expired reset link"));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = Argon2::default().hash_password(input.password.as_bytes(), &salt)
+        .map_err(internal)?.to_string();
+    let mut tx = s.db.begin().await.map_err(internal)?;
+    let consumed: Option<String> = sqlx::query_scalar("DELETE FROM password_resets WHERE token_hash=? AND expires_at>? RETURNING user_id")
+        .bind(hash(&input.token)).bind(now()).fetch_optional(&mut *tx).await.map_err(internal)?;
+    let user_id = consumed.ok_or_else(|| fail(StatusCode::BAD_REQUEST, "Invalid or expired reset link"))?;
+    sqlx::query("UPDATE users SET password_hash=? WHERE id=?")
+        .bind(password_hash).bind(&user_id).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=?").bind(&user_id).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("DELETE FROM password_resets WHERE user_id=?").bind(&user_id).execute(&mut *tx).await.map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok":true})))
+}
+
 async fn chats(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Vec<Chat>> {
     let user = auth(&s, &headers).await?;
     let list = sqlx::query_as::<_, Chat>("SELECT id,title,created_at FROM chats WHERE user_id=? ORDER BY created_at DESC")
@@ -206,7 +341,18 @@ async fn send_message(State(s): State<AppState>, headers: HeaderMap, Path(chat_i
     if exists.is_none() { return Err(fail(StatusCode::NOT_FOUND, "Chat not found")); }
     let content = input.content.trim();
     if content.is_empty() || content.len() > 32_000 { return Err(fail(StatusCode::BAD_REQUEST, "Prompt must be 1–32000 bytes")); }
-    let model = choose_model(&s.cfg, &input.tier, content)?;
+    let model = if let Some(selected) = input.model.as_deref() {
+        let available = provider_models(&s).await?;
+        if !available.iter().any(|m| m.id == selected) {
+            return Err(fail(StatusCode::BAD_REQUEST, "Selected model is no longer in the provider catalog"));
+        }
+        selected.to_string()
+    } else {
+        // Backward-compatible legacy tier input for existing API test scripts.
+        let tier = input.tier.as_deref().unwrap_or("medium");
+        choose_model(&s.cfg, tier, content)?
+    };
+
     if s.cfg.llm_base_url.is_empty() {
         return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "LLM_BASE_URL not configured"));
     }
@@ -311,17 +457,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         llm_base_url: env::var("LLM_BASE_URL").unwrap_or_default(),
         llm_key: env::var("LLM_API_KEY").unwrap_or_default(),
         signup_enabled: env::var("SIGNUP_ENABLED").unwrap_or_default() == "true",
+        resend_api_key: env::var("RESEND_API_KEY").unwrap_or_default(),
+        mail_from: env::var("MAIL_FROM").unwrap_or_default(),
+        app_public_url: env::var("APP_PUBLIC_URL").unwrap_or_default(),
     };
     // Never silently claim remote attestation merely because the process runs in Phala.
     let origin = env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".into());
     let cors = CorsLayer::new().allow_origin(origin.parse::<HeaderValue>()?)
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-    let state = AppState { db, cfg: Arc::new(cfg), client: reqwest::Client::builder().timeout(Duration::from_secs(180)).build()? };
+    let state = AppState {
+        db, cfg: Arc::new(cfg),
+        client: reqwest::Client::builder().timeout(Duration::from_secs(180)).build()?,
+        models_cache: Arc::new(tokio::sync::RwLock::new(None)),
+    };
     let app = Router::new()
         .route("/healthz", get(|| async { Json(json!({"ok":true})) }))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
+        .route("/api/auth/forgot-password", post(forgot_password))
+        .route("/api/auth/reset-password", post(reset_password))
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", post(logout))
         .route("/api/models", get(models))
@@ -347,6 +502,7 @@ mod tests {
             small: "small-model".into(), medium: "medium-model".into(),
             large: "large-model".into(), llm_base_url: String::new(),
             llm_key: String::new(), signup_enabled: false,
+            resend_api_key: String::new(), mail_from: String::new(), app_public_url: String::new(),
         };
         assert_eq!(choose_model(&settings, "auto", "hi").unwrap(), "small-model");
         assert_eq!(choose_model(&settings, "medium", "hi").unwrap(), "medium-model");
