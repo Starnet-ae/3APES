@@ -1,4 +1,4 @@
-export type Model = { tier: string; name: string }
+export type Model = { id: string; name: string; context_window: number | null; max_output_tokens: number | null }
 export type Chat = { id: string; title: string; created_at: number }
 export type Message = { id: string; role: 'user' | 'assistant'; content: string; model: string | null; created_at: number }
 export type ChatDetail = { chat: Chat; messages: Message[] }
@@ -32,13 +32,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 export async function streamMessage(
   chatId: string,
   content: string,
-  tier: string,
+  model: string,
   onEvent: (event: string, data: any) => void,
 ): Promise<void> {
   const res = await fetch(`${API_URL}/api/chats/${encodeURIComponent(chatId)}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
-    body: JSON.stringify({ content, tier }),
+    body: JSON.stringify({ content, model }),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({})) as { error?: string }
